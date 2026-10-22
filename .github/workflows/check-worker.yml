@@ -1,10 +1,4 @@
-      - name: Show checked-out revision
-        run: |
-          git status --short --branch
-          git log -1 --format='%H %s'
-          test -f worker-prepaired.js && echo "Draft file found"
-          
-        name: Check Repaired Worker
+name: Check Repaired Worker
 
 on:
   push:
@@ -21,9 +15,16 @@ jobs:
         with:
           ref: feature/safe-coding-workf
 
+      - name: Show checked-out revision
+        run: |
+          git status --short --branch
+          git log -1 --format='%H %s'
+          test -f worker-prepaired.js && echo "Draft file found"
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - run: node --input-type=module --check < worker-prepaired.js
+      - name: Check repaired worker syntax
+        run: node --input-type=module --check < worker-prepaired.js
