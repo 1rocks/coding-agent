@@ -1,4 +1,10 @@
-name: Check Repaired Worker
+      - name: Show checked-out revision
+        run: |
+          git status --short --branch
+          git log -1 --format='%H %s'
+          test -f worker-prepaired.js && echo "Draft file found"
+          
+        name: Check Repaired Worker
 
 on:
   push:
