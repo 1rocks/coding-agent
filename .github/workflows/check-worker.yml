@@ -20,5 +20,4 @@ jobs:
         with:
           node-version: 22
 
-      - name: Check repaired worker JavaScript syntax
-        run: node --check worker.js
+      - run: node --input-type=module --check < worker-prepaired.js
