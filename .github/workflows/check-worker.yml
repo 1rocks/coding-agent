@@ -1,23 +1,24 @@
 name: Check Repaired Worker
 
 on:
-push:
-branches:
-- feature/safe-coding-workf
-workflow_dispatch:
+  push:
+    branches:
+      - feature/safe-coding-workf
+  workflow_dispatch:
 
 jobs:
-syntax-check:
-runs-on: ubuntu-latest
-steps:
-- name: Check out repository
-uses: actions/checkout@v4
-with:
-ref: feature/safe-coding-workf
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: feature/safe-coding-workf
 
-  - name: Set up Node.js
-    uses: actions/setup-node@v4
-    with:
-      node-version: 22
-  - name: Check JavaScript syntax
-    run: node --input-type=module --check < worker-prepaired.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check JavaScript syntax
+        run: node --check worker.js
