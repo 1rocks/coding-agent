@@ -1,16 +1,16 @@
 name: Check Repaired Worker
 
 on:
-workflow_dispatch:
 push:
-paths:
-- “.github/workflows/check-worker.yml”
+branches:
+- feature/safe-coding-workf
+workflow_dispatch:
 
 jobs:
 syntax-check:
 runs-on: ubuntu-latest
 steps:
-- name: Check out safe-coding branch
+- name: Check out repository
 uses: actions/checkout@v4
 with:
 ref: feature/safe-coding-workf
@@ -20,4 +20,4 @@ ref: feature/safe-coding-workf
     with:
       node-version: 22
   - name: Check JavaScript syntax
-    run: node --check worker-prepaired.js
+    run: node --input-type=module --check < worker-prepaired.js
