@@ -1,0 +1,32 @@
+name: LOKI Agent Environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check Node.js
+        run: node --version
+
+      - name: Check npm
+        run: npm --version
+
+      - name: Check Git
+        run: git --version
+
+      - name: Environment ready
+        run: echo "LOKI execution environment is ready!"
