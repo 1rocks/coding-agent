@@ -19,14 +19,27 @@ jobs:
         with:
           node-version: 22
 
-      - name: Check Node.js
-        run: node --version
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
 
-      - name: Check npm
-        run: npm --version
+      - name: Install Agent Browser
+        run: |
+          npm install -g agent-browser
+          agent-browser install
 
-      - name: Check Git
-        run: git --version
+      - name: Check Codex
+        run: codex --version
 
-      - name: Environment ready
-        run: echo "LOKI execution environment is ready!"
+      - name: Check Agent Browser
+        run: agent-browser --version
+
+      - name: Check Agent Browser skills
+        run: |
+          npx -y skills add vercel-labs/agent-browser
+          agent-browser skills list
+
+      - name: Test browser
+        run: |
+          agent-browser open https://example.com
+          agent-browser snapshot
+          agent-browser close
