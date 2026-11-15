@@ -87,10 +87,18 @@ export default {
       }
 
       const message = update.message;
-      if (!message?.text || !message.from || !message.chat) return new Response("OK");
+      if (!message?.from || !message.chat) return new Response("OK");
       if (!isAllowedUser(env, message.from.id)) return new Response("OK");
 
       const chatId = message.chat.id;
+
+      // A transcript file (.txt, .srt, .vtt, .md) sent as a document.
+      if (message.document) {
+        await processTranscriptDocument(env, chatId, message, url.origin);
+        return new Response("OK");
+      }
+
+      if (!message.text) return new Response("OK");
       const text = message.text.trim();
       if (!text) return new Response("OK");
 
@@ -103,8 +111,9 @@ export default {
           `🐙 GitHub: ${OWNER}/${REPO}\n📚 YouTube knowledge: Cloudflare Worker + R2/KV\n\n` +
           "MODES\n/chat - Normal conversation\n/coding - GitHub coding mode\n\n" +
           "YOUTUBE KNOWLEDGE\n/youtube <YouTube URL> - Transcript, summary, chapters and knowledge graph\n" +
-          "/yt <YouTube URL> - Shortcut\n\n" +
-          "OTHER\n/repo - Check GitHub access\n/help - Help\n\n" +
+          "/yt <YouTube URL> - Shortcut\n" +
+          "/transcript - Send a transcript file (.txt/.srt/.vtt) with this as the caption, or paste text after it\n\n" +
+          "OTHER\n/repo - Check GitHub access\n/omni - Test the OmniRoute connection\n/help - Help\n\n" +
           "GitHub edits require your approval and create a separate branch. Main is not modified directly.\n" +
           "YouTube results are saved in Cloudflare R2, or in KV if no R2 bucket is bound. Videos without accessible captions cannot be transcribed by this Cloudflare-only version."
         );
@@ -132,6 +141,25 @@ export default {
           return new Response("OK");
         }
         await processYouTube(env, chatId, videoUrl, url.origin);
+        return new Response("OK");
+      }
+
+      if (command.name === "omni") {
+        await sendTelegram(env, chatId, "🔌 Testing OmniRoute...");
+        await sendTelegram(env, chatId, await testOmniRoute(env));
+        return new Response("OK");
+      }
+
+      if (command.name === "transcript") {
+        if (command.argument.length < 300) {
+          await sendTelegram(env, chatId,
+            "📄 TRANSCRIPT MODE\n\n" +
+            "Best: send a .txt, .srt, .vtt or .md transcript file with the caption:\n/transcript Video title\n\n" +
+            "Or paste a transcript (300+ characters) after the command:\n/transcript <transcript text>\n\n" +
+            "On YouTube you can copy it with ... > Show transcript.");
+          return new Response("OK");
+        }
+        await processManualTranscript(env, chatId, command.argument, "Pasted transcript", url.origin);
         return new Response("OK");
       }
 
@@ -557,15 +585,19 @@ async function applyApprovedProposal(env, proposal) {
 // YOUTUBE -> KNOWLEDGE (CLOUDFLARE-NATIVE)
 // ============================================================
 
-async function processYouTube(env, chatId, inputUrl, origin) {
-  if (!hasAIProvider(env)) {
-    await sendTelegram(env, chatId, "❌ No AI provider configured.");
-    return;
-  }
+function knowledgePrerequisiteError(env) {
+  if (!hasAIProvider(env)) return "❌ No AI provider configured.";
   // Storage: R2 if a KNOWLEDGE_BUCKET binding exists, otherwise the APPROVALS KV namespace.
   if (!env.KNOWLEDGE_BUCKET && !env.APPROVALS) {
-    await sendTelegram(env, chatId,
-      "❌ No storage available.\n\nBind either an R2 bucket as KNOWLEDGE_BUCKET or a KV namespace as APPROVALS, then retry.");
+    return "❌ No storage available.\n\nBind either an R2 bucket as KNOWLEDGE_BUCKET or a KV namespace as APPROVALS, then retry.";
+  }
+  return null;
+}
+
+async function processYouTube(env, chatId, inputUrl, origin) {
+  const problem = knowledgePrerequisiteError(env);
+  if (problem) {
+    await sendTelegram(env, chatId, problem);
     return;
   }
 
@@ -581,86 +613,283 @@ async function processYouTube(env, chatId, inputUrl, origin) {
   try {
     const metadata = await getYouTubeMetadata(video.id);
     const transcript = await getYouTubeTranscript(video.id);
-    if (!transcript.text.trim()) throw new Error("YouTube returned an empty transcript.");
-    if (transcript.text.length > YT_MAX_TRANSCRIPT_CHARS) {
-      throw new Error(`Transcript is too long (${transcript.text.length} characters). Limit is ${YT_MAX_TRANSCRIPT_CHARS}.`);
-    }
-
-    await sendTelegram(env, chatId,
-      `🧠 Transcript retrieved (${transcript.segments.length} caption segments). Creating summary and knowledge graph...`);
-
-    const chunks = chunkTranscript(transcript.segments, YT_CHUNK_CHARS);
-    const chunkNotes = [];
-
-    for (let i = 0; i < chunks.length; i++) {
-      const result = await callAI(env, [
-        { role: "system", content:
-          "You are a precise research assistant. Analyze only the supplied YouTube transcript excerpt. Preserve the video's language. Return concise structured notes with facts, concepts, named entities, relationships, and important timestamps. Do not invent information." },
-        { role: "user", content:
-          `Video: ${metadata.title}\nURL: ${video.url}\nTranscript part ${i + 1}/${chunks.length}:\n${chunks[i]}` }
-      ], chatId, origin);
-      if (!result.answer) throw new Error("AI failed while analyzing transcript part " + (i + 1));
-      chunkNotes.push(result.answer);
-    }
-
-    const finalResult = await callAI(env, [
-      { role: "system", content: buildKnowledgePrompt() },
-      { role: "user", content:
-        `VIDEO METADATA\n${JSON.stringify(metadata)}\n\nTRANSCRIPT\n${transcript.text}\n\nCHUNK ANALYSIS\n${chunkNotes.join("\n\n--- PART ---\n\n")}\n\n` +
-        "Create the final knowledge package. Output ONLY valid JSON with keys: summary_markdown, key_points (array), chapters (array of {timestamp,title,summary}), entities (array of {id,label,type,description}), relations (array of {source,target,label}), and language. Keep claims grounded in transcript. Use timestamp links where available." }
-    ], chatId, origin);
-
-    if (!finalResult.answer) throw new Error("AI failed to create the final knowledge package.");
-    const knowledge = parseKnowledgeResult(finalResult.answer);
-    if (!knowledge) throw new Error("AI returned invalid knowledge JSON. No result saved.");
-
-    const now = new Date().toISOString();
-    const base = `youtube/${video.id}`;
-    const meta = {
-      ...metadata, videoId: video.id, url: video.url,
-      transcriptLanguage: transcript.language || null,
-      captionSource: transcript.source,
-      processedAt: now,
-      aiProvider: finalResult.provider,
-      aiModel: finalResult.model
-    };
-    const transcriptText = transcript.segments.map(s =>
-      `[${formatTimestamp(s.start)}] ${s.text}`
-    ).join("\n");
-
-    const graph = {
-      videoId: video.id, title: metadata.title,
-      url: video.url, entities: knowledge.entities || [],
-      relations: knowledge.relations || []
-    };
-    const summaryMarkdown = buildSummaryMarkdown(meta, knowledge, video.url);
-
-    await Promise.all([
-      saveKnowledgeFile(env, `${base}/metadata.json`, JSON.stringify(meta, null, 2), "application/json; charset=utf-8"),
-      saveKnowledgeFile(env, `${base}/transcript.txt`, transcriptText, "text/plain; charset=utf-8"),
-      saveKnowledgeFile(env, `${base}/summary.md`, summaryMarkdown, "text/markdown; charset=utf-8"),
-      saveKnowledgeFile(env, `${base}/knowledge.json`, JSON.stringify(graph, null, 2), "application/json; charset=utf-8")
-    ]);
-
-    await sendTelegram(env, chatId,
-      `✅ YOUTUBE KNOWLEDGE SAVED\n\n` +
-      `🎬 ${metadata.title}\n` +
-      `📺 ${metadata.channel || "Unknown channel"}\n` +
-      `🌐 Language: ${knowledge.language || transcript.language || "Unknown"}\n` +
-      `📝 Transcript: ${transcript.segments.length} segments\n` +
-      `🧠 Entities: ${(knowledge.entities || []).length}\n` +
-      `🔗 Relations: ${(knowledge.relations || []).length}\n\n` +
-      `Storage: ${env.KNOWLEDGE_BUCKET ? "R2" : "KV (key prefix knowledge:)"}\nPath: ${base}/\n\n` +
-      `Files saved:\n• metadata.json\n• transcript.txt\n• summary.md\n• knowledge.json\n\n` +
-      "Use /askvideo <question> <video URL> in a future extension to query saved notes. For now, the full summary is below."
-    );
-    await sendTelegram(env, chatId, summaryMarkdown.slice(0, 12000));
+    await processTranscript(env, chatId, origin, {
+      metadata,
+      transcript,
+      base: `youtube/${video.id}`,
+      sourceUrl: video.url
+    });
   } catch (error) {
     console.error("YouTube processing failed:", String(error));
     await sendTelegram(env, chatId,
       "❌ YOUTUBE PROCESSING FAILED\n\n" + errorMessage(error) +
-      "\n\nThis Cloudflare-only version needs accessible YouTube captions. It does not run local Whisper/FFmpeg, and it does not bypass YouTube caption restrictions.");
+      "\n\nYouTube often blocks requests that come from Cloudflare. Workaround: on YouTube open ... > Show transcript, copy the text, save it as a .txt file and send it to me with the caption:\n/transcript Video title" +
+      "\n\nThis Cloudflare-only version does not run Whisper/FFmpeg and does not bypass YouTube restrictions.");
   }
+}
+
+// ---------- Manual transcripts (uploaded file or pasted text) ----------
+
+async function processTranscriptDocument(env, chatId, message, origin) {
+  const doc = message.document;
+  const fileName = String(doc.file_name || "transcript.txt");
+  const isTextFile = /\.(txt|srt|vtt|md)$/i.test(fileName) || String(doc.mime_type || "").startsWith("text/");
+
+  if (!isTextFile) {
+    await sendTelegram(env, chatId, "Send the transcript as a .txt, .srt, .vtt or .md file.");
+    return;
+  }
+  if ((doc.file_size || 0) > 1000000) {
+    await sendTelegram(env, chatId, "❌ File too large (limit 1 MB).");
+    return;
+  }
+
+  const caption = String(message.caption || "").trim();
+  const captionCommand = parseCommand(caption);
+  const fileTitle = fileName.replace(/\.[^.]+$/, "");
+  const title = captionCommand.name
+    ? (captionCommand.name === "transcript" ? captionCommand.argument : "") || fileTitle
+    : caption || fileTitle;
+
+  let raw;
+  try {
+    await sendTelegram(env, chatId, `📄 Reading ${fileName}...`);
+    raw = await downloadTelegramTextFile(env, doc.file_id);
+  } catch (error) {
+    console.error("Transcript download failed:", String(error));
+    await sendTelegram(env, chatId, "❌ Could not read the file:\n" + errorMessage(error));
+    return;
+  }
+
+  await processManualTranscript(env, chatId, raw, title, origin);
+}
+
+async function downloadTelegramTextFile(env, fileId) {
+  const infoResponse = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  const info = await infoResponse.json();
+
+  if (!infoResponse.ok || !info.ok || !info.result?.file_path)
+    throw new Error("Telegram did not return a download path for this file.");
+
+  const fileResponse = await fetch(
+    `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${info.result.file_path}`);
+
+  if (!fileResponse.ok)
+    throw new Error("Telegram file download failed: HTTP " + fileResponse.status);
+
+  return await fileResponse.text();
+}
+
+async function processManualTranscript(env, chatId, raw, title, origin) {
+  const problem = knowledgePrerequisiteError(env);
+  if (problem) {
+    await sendTelegram(env, chatId, problem);
+    return;
+  }
+
+  try {
+    const parsed = parseTranscriptText(raw);
+    if (!parsed.segments.length) throw new Error("The transcript is empty or unreadable.");
+
+    const cleanTitle = String(title || "Untitled transcript").trim().slice(0, 200);
+    const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+    const slug = slugify(cleanTitle).slice(0, 40) || "transcript";
+
+    await processTranscript(env, chatId, origin, {
+      metadata: {
+        title: cleanTitle,
+        channel: "Manual transcript",
+        description: "",
+        durationSeconds: 0,
+        publishedAt: null
+      },
+      transcript: {
+        segments: parsed.segments,
+        text: parsed.segments.map(segmentLine).join("\n"),
+        language: null,
+        source: "manual upload",
+        hasTimestamps: parsed.hasTimestamps
+      },
+      base: `transcripts/${stamp}-${slug}`,
+      sourceUrl: null
+    });
+  } catch (error) {
+    console.error("Manual transcript processing failed:", String(error));
+    await sendTelegram(env, chatId, "❌ TRANSCRIPT PROCESSING FAILED\n\n" + errorMessage(error));
+  }
+}
+
+function transcriptTimeToSeconds(match) {
+  return Number(match[1] || 0) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+}
+
+function splitLongText(text, maxChars) {
+  if (text.length <= maxChars) return [text];
+  const pieces = [];
+  let current = "";
+
+  for (const sentence of text.split(/(?<=[.!?。؟])\s+/)) {
+    if (sentence.length > maxChars) {
+      if (current) { pieces.push(current); current = ""; }
+      for (let i = 0; i < sentence.length; i += maxChars) pieces.push(sentence.slice(i, i + maxChars));
+      continue;
+    }
+    if (current && current.length + sentence.length + 1 > maxChars) {
+      pieces.push(current);
+      current = "";
+    }
+    current = current ? current + " " + sentence : sentence;
+  }
+
+  if (current) pieces.push(current);
+  return pieces;
+}
+
+function parseTranscriptText(raw) {
+  const text = String(raw || "").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").trim();
+  if (!text) return { segments: [], hasTimestamps: false };
+
+  // SRT / VTT cue blocks
+  if (text.includes("-->")) {
+    const segments = [];
+    const timing = /^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,]\d+)?\s*-->/;
+
+    for (const block of text.split(/\n{2,}/)) {
+      const lines = block.split("\n").map(l => l.trim());
+      const idx = lines.findIndex(l => l.includes("-->"));
+      if (idx < 0) continue;
+      const match = lines[idx].match(timing);
+      if (!match) continue;
+      const cue = lines.slice(idx + 1).join(" ").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+      if (cue) segments.push({ start: transcriptTimeToSeconds(match), duration: 0, text: cue });
+    }
+
+    if (segments.length) return { segments, hasTimestamps: true };
+  }
+
+  // Plain text, optionally with timestamps ("0:12 text", "[01:02] text", or a timestamp on its own line)
+  const tsOnly = /^\[?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]?$/;
+  const tsPrefix = /^\[?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\]?\s+(.+)$/;
+  const segments = [];
+  let pendingStart = null;
+  let foundTimestamps = false;
+
+  const push = (start, value) => {
+    const clean = value.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    for (const piece of splitLongText(clean, 1200)) segments.push({ start, duration: 0, text: piece });
+  };
+
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    let match = line.match(tsOnly);
+    if (match) {
+      pendingStart = transcriptTimeToSeconds(match);
+      foundTimestamps = true;
+      continue;
+    }
+
+    match = line.match(tsPrefix);
+    if (match) {
+      foundTimestamps = true;
+      pendingStart = null;
+      push(transcriptTimeToSeconds(match), match[4]);
+      continue;
+    }
+
+    push(pendingStart, line);
+    pendingStart = null;
+  }
+
+  return { segments, hasTimestamps: foundTimestamps };
+}
+
+// ---------- Shared knowledge pipeline ----------
+
+async function processTranscript(env, chatId, origin, { metadata, transcript, base, sourceUrl }) {
+  if (!transcript.text.trim()) throw new Error("The transcript is empty.");
+  if (transcript.text.length > YT_MAX_TRANSCRIPT_CHARS) {
+    throw new Error(`Transcript is too long (${transcript.text.length} characters). Limit is ${YT_MAX_TRANSCRIPT_CHARS}.`);
+  }
+
+  await sendTelegram(env, chatId,
+    `🧠 Transcript ready (${transcript.segments.length} segments). Creating summary and knowledge graph...`);
+
+  const sourceLabel = sourceUrl || "n/a (manual transcript)";
+  const timestampNote = transcript.hasTimestamps === false
+    ? "NOTE: This transcript has no timestamps. Use empty strings for chapter timestamps and do not invent any.\n\n"
+    : "";
+
+  const chunks = chunkTranscript(transcript.segments, YT_CHUNK_CHARS);
+  const chunkNotes = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const result = await callAI(env, [
+      { role: "system", content:
+        "You are a precise research assistant. Analyze only the supplied transcript excerpt. Preserve the original language. Return concise structured notes with facts, concepts, named entities, relationships, and important timestamps if present. Do not invent information." },
+      { role: "user", content:
+        `Title: ${metadata.title}\nSource: ${sourceLabel}\nTranscript part ${i + 1}/${chunks.length}:\n${chunks[i]}` }
+    ], chatId, origin);
+    if (!result.answer) throw new Error("AI failed while analyzing transcript part " + (i + 1));
+    chunkNotes.push(result.answer);
+  }
+
+  const finalResult = await callAI(env, [
+    { role: "system", content: buildKnowledgePrompt() },
+    { role: "user", content:
+      timestampNote +
+      `VIDEO METADATA\n${JSON.stringify(metadata)}\n\nTRANSCRIPT\n${transcript.text}\n\nCHUNK ANALYSIS\n${chunkNotes.join("\n\n--- PART ---\n\n")}\n\n` +
+      "Create the final knowledge package. Output ONLY valid JSON with keys: summary_markdown, key_points (array), chapters (array of {timestamp,title,summary}), entities (array of {id,label,type,description}), relations (array of {source,target,label}), and language. Keep claims grounded in transcript. Use timestamp links where available." }
+  ], chatId, origin);
+
+  if (!finalResult.answer) throw new Error("AI failed to create the final knowledge package.");
+  const knowledge = parseKnowledgeResult(finalResult.answer);
+  if (!knowledge) throw new Error("AI returned invalid knowledge JSON. No result saved.");
+
+  const meta = {
+    ...metadata,
+    url: sourceUrl,
+    transcriptLanguage: transcript.language || null,
+    captionSource: transcript.source,
+    processedAt: new Date().toISOString(),
+    aiProvider: finalResult.provider,
+    aiModel: finalResult.model
+  };
+
+  const transcriptText = transcript.segments.map(segmentLine).join("\n");
+
+  const graph = {
+    videoId: metadata.videoId || null,
+    title: metadata.title,
+    url: sourceUrl,
+    entities: knowledge.entities || [],
+    relations: knowledge.relations || []
+  };
+  const summaryMarkdown = buildSummaryMarkdown(meta, knowledge, sourceUrl);
+
+  await Promise.all([
+    saveKnowledgeFile(env, `${base}/metadata.json`, JSON.stringify(meta, null, 2), "application/json; charset=utf-8"),
+    saveKnowledgeFile(env, `${base}/transcript.txt`, transcriptText, "text/plain; charset=utf-8"),
+    saveKnowledgeFile(env, `${base}/summary.md`, summaryMarkdown, "text/markdown; charset=utf-8"),
+    saveKnowledgeFile(env, `${base}/knowledge.json`, JSON.stringify(graph, null, 2), "application/json; charset=utf-8")
+  ]);
+
+  await sendTelegram(env, chatId,
+    `✅ KNOWLEDGE SAVED\n\n` +
+    `🎬 ${metadata.title}\n` +
+    `📺 ${metadata.channel || "Unknown channel"}\n` +
+    `🌐 Language: ${knowledge.language || transcript.language || "Unknown"}\n` +
+    `📝 Transcript: ${transcript.segments.length} segments\n` +
+    `🧠 Entities: ${(knowledge.entities || []).length}\n` +
+    `🔗 Relations: ${(knowledge.relations || []).length}\n\n` +
+    `Storage: ${env.KNOWLEDGE_BUCKET ? "R2" : "KV (key prefix knowledge:)"}\nPath: ${base}/\n\n` +
+    `Files saved:\n• metadata.json\n• transcript.txt\n• summary.md\n• knowledge.json\n\n` +
+    "The full summary is below."
+  );
+  await sendTelegram(env, chatId, summaryMarkdown.slice(0, 12000));
 }
 
 async function saveKnowledgeFile(env, path, content, contentType) {
@@ -721,7 +950,7 @@ function buildSummaryMarkdown(meta, knowledge, url) {
   const lines = [
     `# ${meta.title || "YouTube video"}`, "",
     `- **Channel:** ${meta.channel || "Unknown"}`,
-    `- **Video:** ${url}`,
+    ...(url ? [`- **Video:** ${url}`] : []),
     `- **Published:** ${meta.publishedAt || "Unknown"}`,
     `- **Processed:** ${meta.processedAt}`,
     `- **Language:** ${knowledge.language || meta.transcriptLanguage || "Unknown"}`,
@@ -929,12 +1158,18 @@ function decodeHtmlEntities(text) {
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
 }
 
+function segmentLine(segment) {
+  return Number.isFinite(segment.start)
+    ? `[${formatTimestamp(segment.start)}] ${segment.text}`
+    : segment.text;
+}
+
 function chunkTranscript(segments, maxChars) {
   const chunks = [];
   let current = "";
 
   for (const segment of segments) {
-    const line = `[${formatTimestamp(segment.start)}] ${segment.text}\n`;
+    const line = segmentLine(segment) + "\n";
 
     if (current.length + line.length > maxChars && current) {
       chunks.push(current);
@@ -1030,6 +1265,8 @@ function hasAIProvider(env) {
 }
 
 async function callAI(env, messages, chatId, origin) {
+  const omniErrors = [];
+
   if (hasOmniRoute(env)) {
     for (const model of getOmniRouteModels(env)) {
       try {
@@ -1045,6 +1282,7 @@ async function callAI(env, messages, chatId, origin) {
         }
       } catch (error) {
         console.error("OmniRoute model failed:", model, String(error));
+        omniErrors.push(`${model}: ${errorMessage(error)}`);
       }
     }
   }
@@ -1052,7 +1290,10 @@ async function callAI(env, messages, chatId, origin) {
   if (env.OPENROUTER_API_KEY) {
     // Only announce a switch if OmniRoute was actually configured and failed.
     if (hasOmniRoute(env)) {
-      await sendTelegram(env, chatId, "⚠️ OmniRoute failed. Switching to OpenRouter Free.");
+      await sendTelegram(env, chatId,
+        "⚠️ OmniRoute failed. Switching to OpenRouter Free." +
+        (omniErrors.length ? "\n\nReason:\n" + omniErrors.join("\n").slice(0, 700) : "") +
+        "\n\nRun /omni to test the connection.");
     }
 
     try {
@@ -1078,6 +1319,64 @@ async function callAI(env, messages, chatId, origin) {
   return { answer: null, provider: null, model: null };
 }
 
+async function testOmniRoute(env) {
+  const missing = [];
+  if (!env.OMNIROUTE_BASE_URL) missing.push("OMNIROUTE_BASE_URL");
+  if (!env.OMNIROUTE_API_KEY) missing.push("OMNIROUTE_API_KEY");
+  if (missing.length) return "❌ Not configured. Missing variable(s): " + missing.join(", ");
+
+  let parsed;
+  try {
+    parsed = new URL(env.OMNIROUTE_BASE_URL);
+  } catch {
+    return "❌ OMNIROUTE_BASE_URL is not a valid URL. Example: https://your-app.example.com/v1";
+  }
+
+  const base = env.OMNIROUTE_BASE_URL.replace(/\/+$/, "");
+  const root = base.endsWith("/v1") ? base : base + "/v1";
+  const models = getOmniRouteModels(env);
+  const lines = [
+    `Base URL: ${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`,
+    `Models the Worker tries: ${models.join(", ")}`
+  ];
+
+  try {
+    const response = await fetch(root + "/models", {
+      headers: { Authorization: `Bearer ${env.OMNIROUTE_API_KEY}` },
+      signal: AbortSignal.timeout(20000)
+    });
+    const body = await response.text();
+    lines.push(`GET /models: HTTP ${response.status}`);
+
+    if (response.ok) {
+      try {
+        const ids = (JSON.parse(body).data || []).map(m => m.id);
+        lines.push(`Models available: ${ids.length}`);
+        if (ids.length) lines.push(ids.slice(0, 15).join(", "));
+        const missingModels = models.filter(m => !ids.includes(m));
+        if (ids.length && missingModels.length)
+          lines.push("⚠️ Not in OmniRoute's list: " + missingModels.join(", "));
+      } catch {
+        lines.push("Response was not JSON (probably the wrong URL): " + body.slice(0, 120).replace(/\s+/g, " "));
+      }
+    } else {
+      lines.push(body.slice(0, 200).replace(/\s+/g, " "));
+    }
+  } catch (error) {
+    lines.push("GET /models failed: " + errorMessage(error));
+  }
+
+  try {
+    await requestAI(env.OMNIROUTE_BASE_URL, env.OMNIROUTE_API_KEY, models[0],
+      [{ role: "user", content: "Reply with the word OK." }], {}, 20);
+    lines.push(`✅ Chat test with ${models[0]}: OK`);
+  } catch (error) {
+    lines.push(`❌ Chat test with ${models[0]} failed: ${errorMessage(error)}`);
+  }
+
+  return lines.join("\n");
+}
+
 function getOmniRouteModels(env) {
   const models = [];
   const primary = String(env.OMNIROUTE_MODEL || DEFAULT_OMNIROUTE_MODEL).trim();
@@ -1094,7 +1393,7 @@ function getOmniRouteModels(env) {
   return models;
 }
 
-async function requestAI(baseUrl, apiKey, model, messages, extraHeaders = {}) {
+async function requestAI(baseUrl, apiKey, model, messages, extraHeaders = {}, maxTokens = 18000) {
   const base = baseUrl.replace(/\/+$/, "");
   const endpoint = base.endsWith("/v1")
     ? base + "/chat/completions"
@@ -1110,7 +1409,7 @@ async function requestAI(baseUrl, apiKey, model, messages, extraHeaders = {}) {
     body: JSON.stringify({
       model,
       messages,
-      max_tokens: 18000,
+      max_tokens: maxTokens,
       temperature: 0.2
     }),
     // If the gateway is asleep or hanging, give up so the fallback can run.
