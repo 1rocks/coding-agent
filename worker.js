@@ -100,13 +100,13 @@ export default {
         await sendTelegram(env, chatId,
           "🤖 LOKI Coding Agent\n\n" +
           "🧠 Primary AI: OmniRoute\n🔄 Fallback: OpenRouter Free\n" +
-          `🐙 GitHub: ${OWNER}/${REPO}\n📚 YouTube knowledge: Cloudflare Worker + R2\n\n` +
+          `🐙 GitHub: ${OWNER}/${REPO}\n📚 YouTube knowledge: Cloudflare Worker + R2/KV\n\n` +
           "MODES\n/chat - Normal conversation\n/coding - GitHub coding mode\n\n" +
           "YOUTUBE KNOWLEDGE\n/youtube <YouTube URL> - Transcript, summary, chapters and knowledge graph\n" +
           "/yt <YouTube URL> - Shortcut\n\n" +
           "OTHER\n/repo - Check GitHub access\n/help - Help\n\n" +
           "GitHub edits require your approval and create a separate branch. Main is not modified directly.\n" +
-          "YouTube results are saved in Cloudflare R2. Videos without accessible captions cannot be transcribed by this Cloudflare-only version."
+          "YouTube results are saved in Cloudflare R2, or in KV if no R2 bucket is bound. Videos without accessible captions cannot be transcribed by this Cloudflare-only version."
         );
         return new Response("OK");
       }
@@ -562,9 +562,10 @@ async function processYouTube(env, chatId, inputUrl, origin) {
     await sendTelegram(env, chatId, "❌ No AI provider configured.");
     return;
   }
-  if (!env.KNOWLEDGE_BUCKET) {
+  // Storage: R2 if a KNOWLEDGE_BUCKET binding exists, otherwise the APPROVALS KV namespace.
+  if (!env.KNOWLEDGE_BUCKET && !env.APPROVALS) {
     await sendTelegram(env, chatId,
-      "❌ R2 binding KNOWLEDGE_BUCKET is missing.\n\nCreate an R2 bucket and bind it to this Worker as KNOWLEDGE_BUCKET, then retry.");
+      "❌ No storage available.\n\nBind either an R2 bucket as KNOWLEDGE_BUCKET or a KV namespace as APPROVALS, then retry.");
     return;
   }
 
@@ -635,18 +636,10 @@ async function processYouTube(env, chatId, inputUrl, origin) {
     const summaryMarkdown = buildSummaryMarkdown(meta, knowledge, video.url);
 
     await Promise.all([
-      env.KNOWLEDGE_BUCKET.put(`${base}/metadata.json`, JSON.stringify(meta, null, 2), {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
-      }),
-      env.KNOWLEDGE_BUCKET.put(`${base}/transcript.txt`, transcriptText, {
-        httpMetadata: { contentType: "text/plain; charset=utf-8" }
-      }),
-      env.KNOWLEDGE_BUCKET.put(`${base}/summary.md`, summaryMarkdown, {
-        httpMetadata: { contentType: "text/markdown; charset=utf-8" }
-      }),
-      env.KNOWLEDGE_BUCKET.put(`${base}/knowledge.json`, JSON.stringify(graph, null, 2), {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
-      })
+      saveKnowledgeFile(env, `${base}/metadata.json`, JSON.stringify(meta, null, 2), "application/json; charset=utf-8"),
+      saveKnowledgeFile(env, `${base}/transcript.txt`, transcriptText, "text/plain; charset=utf-8"),
+      saveKnowledgeFile(env, `${base}/summary.md`, summaryMarkdown, "text/markdown; charset=utf-8"),
+      saveKnowledgeFile(env, `${base}/knowledge.json`, JSON.stringify(graph, null, 2), "application/json; charset=utf-8")
     ]);
 
     await sendTelegram(env, chatId,
@@ -657,7 +650,7 @@ async function processYouTube(env, chatId, inputUrl, origin) {
       `📝 Transcript: ${transcript.segments.length} segments\n` +
       `🧠 Entities: ${(knowledge.entities || []).length}\n` +
       `🔗 Relations: ${(knowledge.relations || []).length}\n\n` +
-      `R2 path: ${base}/\n\n` +
+      `Storage: ${env.KNOWLEDGE_BUCKET ? "R2" : "KV (key prefix knowledge:)"}\nPath: ${base}/\n\n` +
       `Files saved:\n• metadata.json\n• transcript.txt\n• summary.md\n• knowledge.json\n\n` +
       "Use /askvideo <question> <video URL> in a future extension to query saved notes. For now, the full summary is below."
     );
@@ -667,6 +660,15 @@ async function processYouTube(env, chatId, inputUrl, origin) {
     await sendTelegram(env, chatId,
       "❌ YOUTUBE PROCESSING FAILED\n\n" + errorMessage(error) +
       "\n\nThis Cloudflare-only version needs accessible YouTube captions. It does not run local Whisper/FFmpeg, and it does not bypass YouTube caption restrictions.");
+  }
+}
+
+async function saveKnowledgeFile(env, path, content, contentType) {
+  if (env.KNOWLEDGE_BUCKET) {
+    await env.KNOWLEDGE_BUCKET.put(path, content, { httpMetadata: { contentType } });
+  } else {
+    // KV fallback (no card needed). Values up to 25 MiB are allowed.
+    await env.APPROVALS.put("knowledge:" + path, content);
   }
 }
 
