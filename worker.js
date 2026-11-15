@@ -1368,7 +1368,7 @@ async function testOmniRoute(env) {
 
   try {
     await requestAI(env.OMNIROUTE_BASE_URL, env.OMNIROUTE_API_KEY, models[0],
-      [{ role: "user", content: "Reply with the word OK." }], {}, 20);
+      [{ role: "user", content: "Reply with the word OK." }], {}, 400);
     lines.push(`✅ Chat test with ${models[0]}: OK`);
   } catch (error) {
     lines.push(`❌ Chat test with ${models[0]} failed: ${errorMessage(error)}`);
@@ -1422,7 +1422,10 @@ async function requestAI(baseUrl, apiKey, model, messages, extraHeaders = {}, ma
   try {
     data = JSON.parse(body);
   } catch {
-    throw new Error("AI provider returned invalid JSON. HTTP " + response.status);
+    throw new Error(
+      "AI provider returned invalid JSON. HTTP " + response.status +
+      ". Body: " + body.slice(0, 200).replace(/\s+/g, " ")
+    );
   }
 
   if (!response.ok) {
@@ -1434,7 +1437,12 @@ async function requestAI(baseUrl, apiKey, model, messages, extraHeaders = {}, ma
   const answer = data.choices?.[0]?.message?.content;
 
   if (typeof answer !== "string" || !answer.trim()) {
-    throw new Error("AI provider returned no usable text.");
+    const finish = data.choices?.[0]?.finish_reason;
+    throw new Error(
+      "AI provider returned no usable text" +
+      (finish ? ` (finish_reason: ${finish})` : "") +
+      ". Response: " + body.slice(0, 200).replace(/\s+/g, " ")
+    );
   }
 
   return { answer: answer.trim() };
