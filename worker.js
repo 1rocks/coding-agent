@@ -1018,40 +1018,90 @@ function hasAIProvider(env) {
 async function callAI(env, messages, chatId, origin) {
   const models = getOmniRouteModels(env);
   const errors = [];
+  let stopOmniRoute = false;
 
   if (env.OMNIROUTE_BASE_URL && env.OMNIROUTE_API_KEY) {
     for (const model of models) {
-      try {
-        const result = await requestAI(
-          env.OMNIROUTE_BASE_URL,
-          env.OMNIROUTE_API_KEY,
-          model,
-          messages
-        );
+      // Initial attempt + 2 retries
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const result = await requestAI(
+            env.OMNIROUTE_BASE_URL,
+            env.OMNIROUTE_API_KEY,
+            model,
+            messages
+          );
 
-        if (result.answer) {
-          return { ...result, provider: "OmniRoute", model };
+          if (result.answer) {
+            return {
+              ...result,
+              provider: "OmniRoute",
+              model
+            };
+          }
+
+          throw new Error("Empty AI response");
+
+        } catch (error) {
+          const reason = errorMessage(error);
+
+          errors.push(
+            `${model} (attempt ${attempt + 1}/3): ${reason}`
+          );
+
+          const overloaded =
+            /503|resource pressure|temporarily unavailable/i.test(reason);
+
+          if (overloaded) {
+            if (attempt < 2) {
+              // Wait 1.5 seconds, then 3 seconds
+              const delay = (attempt + 1) * 1500;
+
+              await new Promise(resolve =>
+                setTimeout(resolve, delay)
+              );
+
+              continue;
+            }
+
+            // Service is overloaded.
+            // Don't waste time trying other OmniRoute models.
+            stopOmniRoute = true;
+            break;
+          }
+
+          // Other errors: try the next configured model.
+          break;
         }
-      } catch (error) {
-        const reason = errorMessage(error);
-        errors.push(`${model}: ${reason}`);
-        console.error("OmniRoute failed:", model, reason);
       }
+
+      if (stopOmniRoute) break;
     }
   } else {
-    errors.push("OMNIROUTE_BASE_URL or OMNIROUTE_API_KEY is missing.");
-  }
-
-  if (errors.length) {
-    await sendTelegram(
-      env,
-      chatId,
-      "⚠️ OMNIROUTE DIAGNOSTICS\n\n" + errors.join("\n\n").slice(0, 2500)
+    errors.push(
+      "OMNIROUTE_BASE_URL or OMNIROUTE_API_KEY is missing."
     );
   }
 
+  // Report OmniRoute failure
+  if (errors.length) {
+    console.error("OmniRoute diagnostics:", errors);
+
+    await sendTelegram(
+      env,
+      chatId,
+      "⚠️ OMNIROUTE FAILED\n\n" +
+      errors.join("\n\n").slice(0, 2500)
+    );
+  }
+
+  // OpenRouter fallback
   if (env.OPENROUTER_API_KEY) {
-    await sendTelegram(env, chatId, "🔄 Switching to OpenRouter Free...");
+    await sendTelegram(
+      env,
+      chatId,
+      "🔄 Switching to OpenRouter Free..."
+    );
 
     try {
       const result = await requestAI(
@@ -1059,21 +1109,34 @@ async function callAI(env, messages, chatId, origin) {
         env.OPENROUTER_API_KEY,
         MODEL,
         messages,
-        origin ? {
-          "HTTP-Referer": origin,
-          "X-OpenRouter-Title": "LOKI Coding Agent"
-        } : {}
+        origin
+          ? {
+              "HTTP-Referer": origin,
+              "X-OpenRouter-Title": "LOKI Coding Agent"
+            }
+          : {}
       );
 
       if (result.answer) {
-        return { ...result, provider: "OpenRouter", model: MODEL };
+        return {
+          ...result,
+          provider: "OpenRouter",
+          model: MODEL
+        };
       }
     } catch (error) {
-      console.error("OpenRouter failed:", errorMessage(error));
+      console.error(
+        "OpenRouter failed:",
+        errorMessage(error)
+      );
     }
   }
 
-  return { answer: null, provider: null, model: null };
+  return {
+    answer: null,
+    provider: null,
+    model: null
+  };
 }
 
 function getOmniRouteModels(env) {
