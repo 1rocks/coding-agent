@@ -1017,6 +1017,7 @@ function hasAIProvider(env) {
 
 async function callAI(env, messages, chatId, origin) {
   const models = getOmniRouteModels(env);
+  const errors = [];
 
   if (env.OMNIROUTE_BASE_URL && env.OMNIROUTE_API_KEY) {
     for (const model of models) {
@@ -1032,13 +1033,25 @@ async function callAI(env, messages, chatId, origin) {
           return { ...result, provider: "OmniRoute", model };
         }
       } catch (error) {
-        console.error("OmniRoute model failed:", model, String(error));
+        const reason = errorMessage(error);
+        errors.push(`${model}: ${reason}`);
+        console.error("OmniRoute failed:", model, reason);
       }
     }
+  } else {
+    errors.push("OMNIROUTE_BASE_URL or OMNIROUTE_API_KEY is missing.");
+  }
+
+  if (errors.length) {
+    await sendTelegram(
+      env,
+      chatId,
+      "⚠️ OMNIROUTE DIAGNOSTICS\n\n" + errors.join("\n\n").slice(0, 2500)
+    );
   }
 
   if (env.OPENROUTER_API_KEY) {
-    await sendTelegram(env, chatId, "⚠️ OmniRoute failed. Switching to OpenRouter Free.");
+    await sendTelegram(env, chatId, "🔄 Switching to OpenRouter Free...");
 
     try {
       const result = await requestAI(
@@ -1056,7 +1069,7 @@ async function callAI(env, messages, chatId, origin) {
         return { ...result, provider: "OpenRouter", model: MODEL };
       }
     } catch (error) {
-      console.error("OpenRouter fallback failed:", String(error));
+      console.error("OpenRouter failed:", errorMessage(error));
     }
   }
 
@@ -1210,7 +1223,7 @@ async function githubRequest(env, endpoint, options = {}) {
     "X-GitHub-Api-Version": "2022-11-28",
     ...(options.headers || {})
   };
-  const response =- await fetch(url, {
+  const response = await fetch(url, {
     method: options.method || "GET",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined
