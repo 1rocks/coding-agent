@@ -99,13 +99,13 @@ export default {
         await sendTelegram(env, chatId,
           "🤖 LOKI Coding Agent\n\n" +
           "🧠 Primary AI: OmniRoute\n🔄 Fallback: OpenRouter Free\n" +
-          `🐙 GitHub: ${OWNER}/${REPO}\n📚 YouTube knowledge: Cloudflare Worker + R2\n\n` +
+          `🐙 GitHub: ${OWNER}/${REPO}\n📚 YouTube knowledge: Cloudflare Workers KV\n\n` +
           "MODES\n/chat - Normal conversation\n/coding - GitHub coding mode\n\n" +
           "YOUTUBE KNOWLEDGE\n/youtube <YouTube URL> - Transcript, summary, chapters and knowledge graph\n" +
           "/yt <YouTube URL> - Shortcut\n\n" +
           "OTHER\n/repo - Check GitHub access\n/help - Help\n\n" +
           "GitHub edits require your approval and create a separate branch. Main is not modified directly.\n" +
-          "YouTube results are saved in Cloudflare R2. Videos without accessible captions cannot be transcribed by this Cloudflare-only version."
+          "YouTube results are saved in Cloudflare Workers KV. Videos without accessible captions cannot be transcribed by this Cloudflare-only version."
         );
         return new Response("OK");
       }
@@ -553,9 +553,11 @@ async function processYouTube(env, chatId, inputUrl, origin) {
     await sendTelegram(env, chatId, "❌ No AI provider configured.");
     return;
   }
-  if (!env.KNOWLEDGE_BUCKET) {
+
+  // Workers KV binding check
+  if (!env.KNOWLEDGE_KV) {
     await sendTelegram(env, chatId,
-      "❌ R2 binding KNOWLEDGE_BUCKET is missing.\n\nCreate an R2 bucket and bind it to this Worker as KNOWLEDGE_BUCKET, then retry.");
+      "❌ Workers KV binding KNOWLEDGE_KV is missing.\n\nBind your LOKI_KNOWLEDGE namespace to this Worker using the variable name KNOWLEDGE_KV, then retry.");
     return;
   }
 
@@ -568,10 +570,13 @@ async function processYouTube(env, chatId, inputUrl, origin) {
   }
 
   await sendTelegram(env, chatId, `🎬 Getting YouTube captions for ${video.id}...`);
+
   try {
     const metadata = await getYouTubeMetadata(video.id);
     const transcript = await getYouTubeTranscript(video.id);
+
     if (!transcript.text.trim()) throw new Error("YouTube returned an empty transcript.");
+
     if (transcript.text.length > YT_MAX_TRANSCRIPT_CHARS) {
       throw new Error(`Transcript is too long (${transcript.text.length} characters). Limit is ${YT_MAX_TRANSCRIPT_CHARS}.`);
     }
@@ -589,7 +594,9 @@ async function processYouTube(env, chatId, inputUrl, origin) {
         { role: "user", content:
           `Video: ${metadata.title}\nURL: ${video.url}\nTranscript part ${i + 1}/${chunks.length}:\n${chunks[i]}` }
       ], chatId, origin);
+
       if (!result.answer) throw new Error("AI failed while analyzing transcript part " + (i + 1));
+
       chunkNotes.push(result.answer);
     }
 
@@ -601,43 +608,65 @@ async function processYouTube(env, chatId, inputUrl, origin) {
     ], chatId, origin);
 
     if (!finalResult.answer) throw new Error("AI failed to create the final knowledge package.");
+
     const knowledge = parseKnowledgeResult(finalResult.answer);
+
     if (!knowledge) throw new Error("AI returned invalid knowledge JSON. No result saved.");
 
     const now = new Date().toISOString();
     const base = `youtube/${video.id}`;
+
     const meta = {
-      ...metadata, videoId: video.id, url: video.url,
+      ...metadata,
+      videoId: video.id,
+      url: video.url,
       transcriptLanguage: transcript.language || null,
       captionSource: transcript.source,
       processedAt: now,
       aiProvider: finalResult.provider,
       aiModel: finalResult.model
     };
+
     const transcriptText = transcript.segments.map(s =>
       `[${formatTimestamp(s.start)}] ${s.text}`
     ).join("\n");
 
     const graph = {
-      videoId: video.id, title: metadata.title,
-      url: video.url, entities: knowledge.entities || [],
+      videoId: video.id,
+      title: metadata.title,
+      url: video.url,
+      entities: knowledge.entities || [],
       relations: knowledge.relations || []
     };
+
     const summaryMarkdown = buildSummaryMarkdown(meta, knowledge, video.url);
 
+    // Save all four files in Workers KV.
+    // Slash-separated keys preserve the same logical folder structure.
     await Promise.all([
-      env.KNOWLEDGE_BUCKET.put(`${base}/metadata.json`, JSON.stringify(meta, null, 2), {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
-      }),
-      env.KNOWLEDGE_BUCKET.put(`${base}/transcript.txt`, transcriptText, {
-        httpMetadata: { contentType: "text/plain; charset=utf-8" }
-      }),
-      env.KNOWLEDGE_BUCKET.put(`${base}/summary.md`, summaryMarkdown, {
-        httpMetadata: { contentType: "text/markdown; charset=utf-8" }
-      }),
-      env.KNOWLEDGE_BUCKET.put(`${base}/knowledge.json`, JSON.stringify(graph, null, 2), {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
-      })
+      env.KNOWLEDGE_KV.put(
+        `${base}/metadata.json`,
+        JSON.stringify(meta, null, 2),
+        { metadata: { contentType: "application/json; charset=utf-8" } }
+      ),
+
+      env.KNOWLEDGE_KV.put(
+        `${base}/transcript.txt`,
+        transcriptText,
+        { metadata: { contentType: "text/plain; charset=utf-8" } }
+      ),
+
+      env.KNOWLEDGE_KV.put(
+        `${base}/summary.md`,
+        summaryMarkdown,
+        { metadata: { contentType: "text/markdown; charset=utf-8" } }
+      ),
+
+      env.KNOWLEDGE_KV.put(
+        `${base}/knowledge.json`,
+        JSON.stringify(graph, null, 2),
+        { metadata: { contentType: "application/json; charset=utf-8" } }
+      )
     ]);
 
     await sendTelegram(env, chatId,
@@ -648,13 +677,16 @@ async function processYouTube(env, chatId, inputUrl, origin) {
       `📝 Transcript: ${transcript.segments.length} segments\n` +
       `🧠 Entities: ${(knowledge.entities || []).length}\n` +
       `🔗 Relations: ${(knowledge.relations || []).length}\n\n` +
-      `R2 path: ${base}/\n\n` +
+      `KV keys: ${base}/\n\n` +
       `Files saved:\n• metadata.json\n• transcript.txt\n• summary.md\n• knowledge.json\n\n` +
       "Use /askvideo <question> <video URL> in a future extension to query saved notes. For now, the full summary is below."
     );
+
     await sendTelegram(env, chatId, summaryMarkdown.slice(0, 12000));
+
   } catch (error) {
     console.error("YouTube processing failed:", String(error));
+
     await sendTelegram(env, chatId,
       "❌ YOUTUBE PROCESSING FAILED\n\n" + errorMessage(error) +
       "\n\nThis Cloudflare-only version needs accessible YouTube captions. It does not run local Whisper/FFmpeg, and it does not bypass YouTube caption restrictions.");
@@ -685,24 +717,38 @@ Rules:
 
 function parseKnowledgeResult(answer) {
   let text = String(answer || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+
   try {
     const parsed = JSON.parse(text);
+
     if (typeof parsed.summary_markdown !== "string") return null;
+
     if (!Array.isArray(parsed.entities)) parsed.entities = [];
     if (!Array.isArray(parsed.relations)) parsed.relations = [];
     if (!Array.isArray(parsed.key_points)) parsed.key_points = [];
     if (!Array.isArray(parsed.chapters)) parsed.chapters = [];
+
     return parsed;
+
   } catch {
     const start = text.indexOf("{"), end = text.lastIndexOf("}");
+
     if (start < 0 || end <= start) return null;
+
     try {
       const parsed = JSON.parse(text.slice(start, end + 1));
+
       if (typeof parsed.summary_markdown !== "string") return null;
-      for (const key of ["entities", "relations", "key_points", "chapters"])
+
+      for (const key of ["entities", "relations", "key_points", "chapters"]) {
         if (!Array.isArray(parsed[key])) parsed[key] = [];
+      }
+
       return parsed;
-    } catch { return null; }
+
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -728,12 +774,19 @@ function buildSummaryMarkdown(meta, knowledge, url) {
     ...(knowledge.relations || []).map(r => `- ${r.source} --${r.label}--> ${r.target}`),
     ""
   ];
+
   return lines.join("\n");
 }
 
 function parseYouTubeUrl(input) {
   let url;
-  try { url = new URL(input.trim()); } catch { throw new Error("Invalid YouTube URL."); }
+
+  try {
+    url = new URL(input.trim());
+  } catch {
+    throw new Error("Invalid YouTube URL.");
+  }
+
   const host = url.hostname.replace(/^www\./, "").toLowerCase();
   let id = "";
 
@@ -796,10 +849,13 @@ async function getYouTubeMetadata(videoId) {
 function extractJsonObject(html, variableName) {
   const marker = variableName + " = ";
   const start = html.indexOf(marker);
+
   if (start < 0) return null;
 
   let i = start + marker.length;
+
   while (/\s/.test(html[i] || "")) i++;
+
   if (html[i] !== "{") return null;
 
   const objectStart = i;
@@ -817,6 +873,7 @@ function extractJsonObject(html, variableName) {
       else if (c === "{") depth++;
       else if (c === "}") {
         depth--;
+
         if (depth === 0) {
           try {
             return JSON.parse(html.slice(objectStart, i + 1));
@@ -864,14 +921,17 @@ async function getYouTubeTranscript(videoId) {
 
   try {
     const data = JSON.parse(raw);
+
     segments = (data.events || []).flatMap(event => {
       const text = (event.segs || []).map(s => s.utf8 || "").join("").replace(/\s+/g, " ").trim();
+
       return text ? [{
         start: Number(event.tStartMs || 0) / 1000,
         duration: Number(event.dDurationMs || 0) / 1000,
         text
       }] : [];
     });
+
   } catch {
     segments = parseXmlCaptions(raw);
   }
@@ -893,6 +953,7 @@ function parseXmlCaptions(xml) {
 
   while ((match = regex.exec(xml))) {
     const startMatch = match[1].match(/\bstart="([^"]+)"/);
+
     if (!startMatch) continue;
 
     const start = Number(startMatch[1]);
@@ -932,6 +993,7 @@ function chunkTranscript(segments, maxChars) {
   }
 
   if (current) chunks.push(current);
+
   return chunks;
 }
 
@@ -1000,6 +1062,7 @@ async function handleChat(env, chatId, text) {
     });
 
     await sendTelegram(env, chatId, result.answer);
+
   } catch (error) {
     console.error("Chat failed:", String(error));
     await sendTelegram(env, chatId, "⚠️ Chat failed:\n" + errorMessage(error));
@@ -1022,7 +1085,6 @@ async function callAI(env, messages, chatId, origin) {
 
   if (env.OMNIROUTE_BASE_URL && env.OMNIROUTE_API_KEY) {
     for (const model of models) {
-      // Initial attempt + 2 retries
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const result = await requestAI(
@@ -1054,7 +1116,6 @@ async function callAI(env, messages, chatId, origin) {
 
           if (overloaded) {
             if (attempt < 2) {
-              // Wait 1.5 seconds, then 3 seconds
               const delay = (attempt + 1) * 1500;
 
               await new Promise(resolve =>
@@ -1064,26 +1125,23 @@ async function callAI(env, messages, chatId, origin) {
               continue;
             }
 
-            // Service is overloaded.
-            // Don't waste time trying other OmniRoute models.
             stopOmniRoute = true;
             break;
           }
 
-          // Other errors: try the next configured model.
           break;
         }
       }
 
       if (stopOmniRoute) break;
     }
+
   } else {
     errors.push(
       "OMNIROUTE_BASE_URL or OMNIROUTE_API_KEY is missing."
     );
   }
 
-  // Report OmniRoute failure
   if (errors.length) {
     console.error("OmniRoute diagnostics:", errors);
 
@@ -1095,7 +1153,6 @@ async function callAI(env, messages, chatId, origin) {
     );
   }
 
-  // OpenRouter fallback
   if (env.OPENROUTER_API_KEY) {
     await sendTelegram(
       env,
@@ -1124,6 +1181,7 @@ async function callAI(env, messages, chatId, origin) {
           model: MODEL
         };
       }
+
     } catch (error) {
       console.error(
         "OpenRouter failed:",
@@ -1207,8 +1265,11 @@ async function requestAI(baseUrl, apiKey, model, messages, extraHeaders = {}) {
 
 function parseCommand(text) {
   if (!text.startsWith("/")) return { name: "", argument: "" };
+
   const space = text.indexOf(" ");
+
   if (space === -1) return { name: text.slice(1).toLowerCase(), argument: "" };
+
   return {
     name: text.slice(1, space).toLowerCase(),
     argument: text.slice(space + 1).trim()
@@ -1217,20 +1278,25 @@ function parseCommand(text) {
 
 function isAllowedUser(env, userId) {
   if (!env.ALLOWED_USERS) return true;
+
   const allowed = String(env.ALLOWED_USERS).split(",").map(id => id.trim());
+
   return allowed.includes(String(userId));
 }
 
 function isAllowedFile(path) {
   if (/(^\.env|\/\.env|id_rsa|credentials|secret)/i.test(path)) return false;
+
   return /\.(js|mjs|ts|json|md|py|html|css|yml|yaml|sh)$/i.test(path);
 }
 
 function selectFiles(candidates, task) {
   const lowerTask = task.toLowerCase();
+
   return candidates.sort((a, b) => {
     const aMatch = lowerTask.includes(a.path.toLowerCase()) ? 1 : 0;
     const bMatch = lowerTask.includes(b.path.toLowerCase()) ? 1 : 0;
+
     return bMatch - aMatch;
   });
 }
@@ -1241,12 +1307,15 @@ function slugify(text) {
 
 async function sendTelegram(env, chatId, text, replyMarkup = null) {
   if (!env.TELEGRAM_BOT_TOKEN) return;
+
   const body = {
     chat_id: chatId,
     text: String(text).slice(0, 4000),
     disable_web_page_preview: true
   };
+
   if (replyMarkup) body.reply_markup = replyMarkup;
+
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1256,6 +1325,7 @@ async function sendTelegram(env, chatId, text, replyMarkup = null) {
 
 async function removeInlineKeyboard(env, callback) {
   if (!env.TELEGRAM_BOT_TOKEN || !callback.message) return;
+
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1269,16 +1339,19 @@ async function removeInlineKeyboard(env, callback) {
 
 async function answerCallbackQuery(env, callbackQueryId) {
   if (!env.TELEGRAM_BOT_TOKEN) return false;
+
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ callback_query_id: callbackQueryId })
   });
+
   return res.ok;
 }
 
 async function githubRequest(env, endpoint, options = {}) {
   const url = endpoint.startsWith("https://") ? endpoint : `https://api.github.com${endpoint}`;
+
   const headers = {
     Authorization: `Bearer ${env.GITHUB_TOKEN}`,
     Accept: "vnd.github+json",
@@ -1286,17 +1359,26 @@ async function githubRequest(env, endpoint, options = {}) {
     "X-GitHub-Api-Version": "2022-11-28",
     ...(options.headers || {})
   };
+
   const response = await fetch(url, {
     method: options.method || "GET",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined
   });
+
   const text = await response.text();
   let data;
-  try { data = JSON.parse(text); } catch { data = { message: text }; }
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { message: text };
+  }
+
   if (!response.ok) {
     throw new Error(`GitHub API error HTTP ${response.status}: ${data.message || text}`);
   }
+
   return data;
 }
 
