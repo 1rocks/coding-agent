@@ -5,7 +5,7 @@ const OWNER = "1rocks";
 const REPO = "coding-agent";
 
 const MAX_FILES = 6;
-const MAX_FILE_SIZE = 60000;
+const MAX_FILE_SIZE = 100000;
 const MAX_CONTEXT_SIZE = 70000;
 const MAX_CHAT_HISTORY = 12;
 const PROPOSAL_TTL = 3600;
