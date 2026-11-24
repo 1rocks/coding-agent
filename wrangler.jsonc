@@ -48,12 +48,9 @@
     ]
   },
 
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": [
-        "LokiCoordinator"
-      ]
-    }
-  ]
+  "exports": {
+  "LokiCoordinator": {
+    "type": "durable-object",
+    "storage": "sqlite"
+  }
 }
