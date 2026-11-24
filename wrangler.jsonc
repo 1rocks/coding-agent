@@ -1,1 +1,59 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
 
+  "name": "telegram-coding-agent",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-18",
+
+  "ai": {
+    "binding": "AI"
+  },
+
+  "kv_namespaces": [
+    {
+      "binding": "APPROVALS",
+      "id": "b4a219a04a52402c9f17cc068be11c89"
+    },
+    {
+      "binding": "KNOWLEDGE_KV",
+      "id": "84c1537ab2e54c5c962e1ff999907ea1"
+    }
+  ],
+
+  "queues": {
+    "producers": [
+      {
+        "binding": "UPDATE_QUEUE",
+        "queue": "loki-updates"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "loki-updates",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "retry_delay": 5,
+        "max_concurrency": 1
+      }
+    ]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COORDINATOR",
+        "class_name": "LokiCoordinator"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "LokiCoordinator"
+      ]
+    }
+  ]
+}
