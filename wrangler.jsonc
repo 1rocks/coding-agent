@@ -9,6 +9,11 @@
     "binding": "AI"
   },
 
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
   "kv_namespaces": [
     {
       "binding": "APPROVALS",
@@ -48,7 +53,7 @@
     ]
   },
 
-    "exports": {
+  "exports": {
     "LokiCoordinator": {
       "type": "durable-object",
       "storage": "sqlite"
