@@ -48,10 +48,10 @@
     ]
   },
 
-  "exports": {
-  "LokiCoordinator": {
-    "type": "durable-object",
-    "storage": "sqlite"
+    "exports": {
+    "LokiCoordinator": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
   }
-}
 }
