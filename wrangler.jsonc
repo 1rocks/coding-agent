@@ -1,19 +1,15 @@
 {
   "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
-
   "name": "telegram-coding-agent",
   "main": "worker.js",
   "compatibility_date": "2026-10-18",
-
   "ai": {
     "binding": "AI"
   },
-
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
   },
-
   "kv_namespaces": [
     {
       "binding": "APPROVALS",
@@ -24,7 +20,6 @@
       "id": "84c1537ab2e54c5c962e1ff999907ea1"
     }
   ],
-
   "queues": {
     "producers": [
       {
@@ -43,7 +38,6 @@
       }
     ]
   },
-
   "durable_objects": {
     "bindings": [
       {
@@ -52,7 +46,6 @@
       }
     ]
   },
-
   "exports": {
     "LokiCoordinator": {
       "type": "durable-object",
